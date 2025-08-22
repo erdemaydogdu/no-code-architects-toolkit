@@ -43,7 +43,28 @@ logger = logging.getLogger(__name__)
             "minItems": 1
         },
         "webhook_url": {"type": "string", "format": "uri"},
-        "id": {"type": "string"}
+        "id": {"type": "string"},
+        
+        # --- Optional transition settings (backward compatible) ---
+        "use_transitions": {"type": "boolean"},
+        # Accept either a single string or an array of strings
+        "transitions": {
+            "oneOf": [
+                {"type": "string"},
+                {"type": "array", "items": {"type": "string"}, "minItems": 1}
+            ]
+        },
+        # Accept either a single number or an array of numbers
+        "transition_durations": {
+            "oneOf": [
+                {"type": "number"},
+                {"type": "array", "items": {"type": "number"}, "minItems": 1}
+            ]
+        },
+        # Normalization parameters used only when transitions are enabled
+        "width":  {"type": "integer", "minimum": 2},
+        "height": {"type": "integer", "minimum": 2},
+        "fps":    {"type": "integer", "minimum": 1}        
     },
     "required": ["video_urls"],
     "additionalProperties": False
@@ -54,10 +75,34 @@ def combine_videos(job_id, data):
     webhook_url = data.get('webhook_url')
     id = data.get('id')
 
-    logger.info(f"Job {job_id}: Received combine-videos request for {len(media_urls)} videos")
+    # Extract optional transition parameters with safe defaults
+    use_transitions = bool(data.get('use_transitions', False))
+    transitions = data.get('transitions', "fade")
+    transition_durations = data.get('transition_durations', 1.0)
+    width = int(data.get('width', 1280))
+    height = int(data.get('height', 720))
+    fps = int(data.get('fps', 30))
+
+    logger.info(
+        f"Job {job_id}: Received combine-videos request | "
+        f"clips={len(media_urls)} | transitions={use_transitions} | "
+        f"trans={transitions} | d={transition_durations} | "
+        f"norm={width}x{height}@{fps} | id={id}"
+    )
 
     try:
-        output_file = process_video_concatenate(media_urls, job_id)
+        output_file = process_video_concatenate(
+            media_urls,
+            job_id,
+            webhook_url=webhook_url,
+            use_transitions=use_transitions,
+            transitions=transitions,
+            transition_durations=transition_durations,
+            width=width,
+            height=height,
+            fps=fps
+        )
+
         logger.info(f"Job {job_id}: Video combination process completed successfully")
 
         cloud_url = upload_file(output_file)
