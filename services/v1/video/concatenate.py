@@ -63,57 +63,53 @@ def _normalize_list(value, target_len):
         lst += [lst[-1]] * (target_len - len(lst))
     return lst[:target_len]
 
+        
 def process_video_concatenate(
     media_urls,
     job_id,
     webhook_url=None,
     *,
     use_transitions=False,
-    transitions="fade",                 # str or list[str] of length (N-1)
-    transition_durations=1.0,           # float or list[float] of length (N-1)
-    width=1920, height=1080, fps=30      # normalization when transitions are enabled
+    transitions="fade",                 # str or list[str] for each join
+    transition_durations=1.0,           # float or list[float] for each join
+    width=1280, height=720, fps=30,
+    preserve_clip_starts=True,          # <-- NEW: add lead-in equal to transition duration
+    pad_color="black"                   # color for the lead-in frames
 ):
     """
-    Combine multiple videos into one.
-    - Default (use_transitions=False): concat demuxer with -c copy (fast, no re-encode).
-    - Transition mode: xfade (video) + acrossfade (audio), re-encoding with libx264/aac.
-
-    Parameters:
-    - transitions: single transition name (e.g., "fade") or list per join
-                   (e.g., ["fade", "wipeleft", "circleopen"]).
-    - transition_durations: single float (e.g., 1.0) or list per join
-                            (e.g., [0.75, 1.0, 1.25]).
+    Combine multiple videos. In transition mode:
+    - Add a lead-in (video black + audio silence) to each clip except the first,
+      equal to the corresponding transition duration, so speech at the start is preserved.
     """
     input_files = []
     output_filename = f"{job_id}.mp4"
     output_path = os.path.join(LOCAL_STORAGE_PATH, output_filename)
 
     try:
-        # 1) Download all media files
+        # 1) Download inputs
         for i, media_item in enumerate(media_urls):
             url = media_item['video_url']
             input_filename = download_file(url, os.path.join(LOCAL_STORAGE_PATH, f"{job_id}_input_{i}"))
             input_files.append(input_filename)
 
-        # Fast path: single file + no transitions
+        # Fast path
         if len(input_files) == 1 and not use_transitions:
             (
-                ffmpeg
-                .input(input_files[0])
+                ffmpeg.input(input_files[0])
                 .output(output_path, c='copy')
                 .overwrite_output()
                 .run(capture_stdout=True, capture_stderr=True)
             )
+
         elif not use_transitions:
-            # 2) Fast concat using concat demuxer
+            # Concat demuxer (no re-encode)
             concat_file_path = os.path.join(LOCAL_STORAGE_PATH, f"{job_id}_concat_list.txt")
-            with open(concat_file_path, 'w') as concat_file:
-                for input_file in input_files:
-                    concat_file.write(f"file '{os.path.abspath(input_file)}'\n")
+            with open(concat_file_path, 'w') as f:
+                for p in input_files:
+                    f.write(f"file '{os.path.abspath(p)}'\n")
 
             (
-                ffmpeg
-                .input(concat_file_path, format='concat', safe=0)
+                ffmpeg.input(concat_file_path, format='concat', safe=0)
                 .output(output_path, c='copy')
                 .overwrite_output()
                 .run(capture_stdout=True, capture_stderr=True)
@@ -121,41 +117,65 @@ def process_video_concatenate(
             os.remove(concat_file_path)
 
         else:
-            # 3) Transition mode: build filter_complex with xfade + acrossfade
+            # Transition mode
             if len(input_files) < 2:
                 raise ValueError("At least two inputs are required for transitions.")
 
-            # Read durations and audio presence for each input
             durations = [_probe_duration(p) for p in input_files]
             audio_flags = [_has_audio_stream(p) for p in input_files]
 
-            # Normalize transitions and durations to (N-1) items
             joins = len(input_files) - 1
             transitions_norm = _normalize_list(transitions, joins)
-            durations_norm = [float(x) for x in _normalize_list(transition_durations, joins)]
+            d_norm = [float(x) for x in _normalize_list(transition_durations, joins)]
+
+            # Compute per-clip lead-in (prepad) in seconds
+            # prepad[0] = 0 (no lead-in for the first), prepad[i] = d_norm[i-1]
+            prepad = [0.0] + d_norm[:]  # length = N, aligns clip i with join (i-1)
 
             filter_lines = []
             v_labels, a_labels = [], []
 
-            # Normalize each input (scale, fps, audio)
             for idx, _ in enumerate(input_files):
                 vlab = f"v{idx}"
                 alab = f"a{idx}"
-                filter_lines.append(
-                    f"[{idx}:v]fps={fps},scale={width}:{height}:force_original_aspect_ratio=decrease,"
-                    f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p[{vlab}]"
-                )
-                if audio_flags[idx]:
-                    filter_lines.append(f"[{idx}:a]aformat=channel_layouts=stereo,aresample=48000[{alab}]")
-                else:
-                    # If no audio on this clip, synthesize silence for its full duration
+
+                # Video normalize + optional lead-in frames
+                if preserve_clip_starts and prepad[idx] > 0:
                     filter_lines.append(
-                        f"anullsrc=channel_layout=stereo:sample_rate=48000,atrim=0:{durations[idx]:.6f},asetpts=N/SR/TB[{alab}]"
+                        f"[{idx}:v]fps={fps},scale={width}:{height}:force_original_aspect_ratio=decrease,"
+                        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p,"
+                        f"tpad=start_duration={prepad[idx]}:color={pad_color}[{vlab}]"
                     )
+                else:
+                    filter_lines.append(
+                        f"[{idx}:v]fps={fps},scale={width}:{height}:force_original_aspect_ratio=decrease,"
+                        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p[{vlab}]"
+                    )
+
+                # Audio normalize (or synth) + optional lead-in silence
+                if audio_flags[idx]:
+                    if preserve_clip_starts and prepad[idx] > 0:
+                        ms = int(round(prepad[idx] * 1000))
+                        # adelay needs one value per channel, "ms|ms" for stereo
+                        filter_lines.append(
+                            f"[{idx}:a]aformat=channel_layouts=stereo,aresample=48000,"
+                            f"adelay={ms}|{ms}[{alab}]"
+                        )
+                    else:
+                        filter_lines.append(
+                            f"[{idx}:a]aformat=channel_layouts=stereo,aresample=48000[{alab}]"
+                        )
+                else:
+                    # Synthesize silence matching clip duration + lead-in
+                    total_sil = durations[idx] + (prepad[idx] if preserve_clip_starts else 0.0)
+                    filter_lines.append(
+                        f"anullsrc=channel_layout=stereo:sample_rate=48000,atrim=0:{total_sil:.6f},asetpts=N/SR/TB[{alab}]"
+                    )
+
                 v_labels.append(vlab)
                 a_labels.append(alab)
 
-            # Chain xfade/acrossfade with per-join transition and duration
+            # Chain xfade/acrossfade
             current_v, current_a = v_labels[0], a_labels[0]
             cum = 0.0
             for k in range(1, len(input_files)):
@@ -163,28 +183,27 @@ def process_video_concatenate(
                 cum += prev_dur
 
                 trans = str(transitions_norm[k-1])
-                d = float(durations_norm[k-1])
+                d_k = float(d_norm[k-1])
 
-                # offset_k = sum(dur[0..k-1]) - sum(d_i for i in 0..k-1)
-                # Since we allow per-join durations, subtract the sum of previous d's
-                prev_d_sum = sum(durations_norm[:k-1]) if k > 1 else 0.0
-                offset = cum - prev_d_sum - d
+                # With lead-in, we want the transition to END exactly at the boundary.
+                # Therefore, start at (cum - d_k).
+                offset = cum - d_k
 
                 next_v, next_a = v_labels[k], a_labels[k]
                 out_v, out_a = f"v{k}o", f"a{k}o"
 
                 filter_lines.append(
-                    f"[{current_v}][{next_v}]xfade=transition={trans}:duration={d}:offset={offset:.6f}[{out_v}]"
+                    f"[{current_v}][{next_v}]xfade=transition={trans}:duration={d_k}:offset={offset:.6f}[{out_v}]"
                 )
                 filter_lines.append(
-                    f"[{current_a}][{next_a}]acrossfade=d={d}[{out_a}]"
+                    f"[{current_a}][{next_a}]acrossfade=d={d_k}[{out_a}]"
                 )
 
                 current_v, current_a = out_v, out_a
 
             filter_complex = "; ".join(filter_lines)
 
-            # Execute via subprocess to map labeled pads safely
+            # Execute
             cmd = ["ffmpeg", "-y"]
             for p in input_files:
                 cmd += ["-i", p]
@@ -198,7 +217,7 @@ def process_video_concatenate(
             ]
             subprocess.run(cmd, check=True)
 
-        # 4) Cleanup input files
+        # Cleanup
         for f in input_files:
             try:
                 os.remove(f)

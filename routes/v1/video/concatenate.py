@@ -64,7 +64,9 @@ logger = logging.getLogger(__name__)
         # Normalization parameters used only when transitions are enabled
         "width":  {"type": "integer", "minimum": 2},
         "height": {"type": "integer", "minimum": 2},
-        "fps":    {"type": "integer", "minimum": 1}        
+        "fps":    {"type": "integer", "minimum": 1},
+        "preserve_clip_starts": {"type": "boolean"},
+        "pad_color": {"type": "string"}       
     },
     "required": ["video_urls"],
     "additionalProperties": False
@@ -82,12 +84,13 @@ def combine_videos(job_id, data):
     width = int(data.get('width', 1280))
     height = int(data.get('height', 720))
     fps = int(data.get('fps', 30))
+    preserve_clip_starts = bool(data.get('preserve_clip_starts', True))
+    pad_color = data.get('pad_color', 'black')
 
     logger.info(
-        f"Job {job_id}: Received combine-videos request | "
-        f"clips={len(media_urls)} | transitions={use_transitions} | "
-        f"trans={transitions} | d={transition_durations} | "
-        f"norm={width}x{height}@{fps} | id={id}"
+        f"Job {job_id}: /combine-videos | clips={len(media_urls)} | transitions={use_transitions} "
+        f"| trans={transitions} | d={transition_durations} | norm={width}x{height}@{fps} "
+        f"| preserve_starts={preserve_clip_starts} pad_color={pad_color} | id={id}"
     )
 
     try:
@@ -100,7 +103,9 @@ def combine_videos(job_id, data):
             transition_durations=transition_durations,
             width=width,
             height=height,
-            fps=fps
+            fps=fps,
+            preserve_clip_starts=preserve_clip_starts,
+            pad_color=pad_color
         )
 
         logger.info(f"Job {job_id}: Video combination process completed successfully")
