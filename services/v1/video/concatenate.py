@@ -117,7 +117,7 @@ def process_video_concatenate(
             os.remove(concat_file_path)
 
         else:
-            # Transition mode
+            # Transition mode (re-encode)
             if len(input_files) < 2:
                 raise ValueError("At least two inputs are required for transitions.")
 
@@ -128,9 +128,8 @@ def process_video_concatenate(
             transitions_norm = _normalize_list(transitions, joins)
             d_norm = [float(x) for x in _normalize_list(transition_durations, joins)]
 
-            # Compute per-clip lead-in (prepad) in seconds
-            # prepad[0] = 0 (no lead-in for the first), prepad[i] = d_norm[i-1]
-            prepad = [0.0] + d_norm[:]  # length = N, aligns clip i with join (i-1)
+            # Lead-in per clip (seconds): prepad[0]=0; prepad[i]=d_norm[i-1] if preserving starts
+            prepad = ([0.0] + d_norm[:]) if preserve_clip_starts else [0.0] * len(input_files)
 
             filter_lines = []
             v_labels, a_labels = [], []
@@ -139,55 +138,57 @@ def process_video_concatenate(
                 vlab = f"v{idx}"
                 alab = f"a{idx}"
 
-                # Video normalize + optional lead-in frames
+                # --- Reset PTS first, then normalize, then optional lead-in on video ---
                 if preserve_clip_starts and prepad[idx] > 0:
                     filter_lines.append(
-                        f"[{idx}:v]fps={fps},scale={width}:{height}:force_original_aspect_ratio=decrease,"
+                        f"[{idx}:v]setpts=PTS-STARTPTS,"
+                        f"fps={fps},scale={width}:{height}:force_original_aspect_ratio=decrease,"
                         f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p,"
                         f"tpad=start_duration={prepad[idx]}:color={pad_color}[{vlab}]"
                     )
                 else:
                     filter_lines.append(
-                        f"[{idx}:v]fps={fps},scale={width}:{height}:force_original_aspect_ratio=decrease,"
+                        f"[{idx}:v]setpts=PTS-STARTPTS,"
+                        f"fps={fps},scale={width}:{height}:force_original_aspect_ratio=decrease,"
                         f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p[{vlab}]"
                     )
 
-                # Audio normalize (or synth) + optional lead-in silence
+                # --- Audio: reset PTS, stereo+48k, resync, optional lead-in via adelay ---
                 if audio_flags[idx]:
                     if preserve_clip_starts and prepad[idx] > 0:
                         ms = int(round(prepad[idx] * 1000))
-                        # adelay needs one value per channel, "ms|ms" for stereo
                         filter_lines.append(
-                            f"[{idx}:a]aformat=channel_layouts=stereo,aresample=48000,"
+                            f"[{idx}:a]asetpts=PTS-STARTPTS,"
+                            f"aformat=channel_layouts=stereo,aresample=48000:async=1:first_pts=0,"
                             f"adelay={ms}|{ms}[{alab}]"
                         )
                     else:
                         filter_lines.append(
-                            f"[{idx}:a]aformat=channel_layouts=stereo,aresample=48000[{alab}]"
+                            f"[{idx}:a]asetpts=PTS-STARTPTS,"
+                            f"aformat=channel_layouts=stereo,aresample=48000:async=1:first_pts=0[{alab}]"
                         )
                 else:
-                    # Synthesize silence matching clip duration + lead-in
+                    # Synthesize silence for (duration + lead-in) if clip has no audio
                     total_sil = durations[idx] + (prepad[idx] if preserve_clip_starts else 0.0)
                     filter_lines.append(
-                        f"anullsrc=channel_layout=stereo:sample_rate=48000,atrim=0:{total_sil:.6f},asetpts=N/SR/TB[{alab}]"
+                        f"anullsrc=channel_layout=stereo:sample_rate=48000,atrim=0:{total_sil:.6f},"
+                        f"asetpts=PTS-STARTPTS[{alab}]"
                     )
 
                 v_labels.append(vlab)
                 a_labels.append(alab)
 
-            # Chain xfade/acrossfade
+            # --- Chain xfade/acrossfade with iterative offsets to avoid freezing ---
             current_v, current_a = v_labels[0], a_labels[0]
-            cum = 0.0
-            for k in range(1, len(input_files)):
-                prev_dur = durations[k-1]
-                cum += prev_dur
+            current_len = durations[0]  # current composed timeline length after first clip (no prepad on clip 0)
 
+            for k in range(1, len(input_files)):
                 trans = str(transitions_norm[k-1])
                 d_k = float(d_norm[k-1])
+                prepad_k = prepad[k]
 
-                # With lead-in, we want the transition to END exactly at the boundary.
-                # Therefore, start at (cum - d_k).
-                offset = cum - d_k
+                # Start xfade so that it ends exactly at the boundary of the previous composed timeline
+                offset = max(current_len - d_k, 0.0)
 
                 next_v, next_a = v_labels[k], a_labels[k]
                 out_v, out_a = f"v{k}o", f"a{k}o"
@@ -199,11 +200,14 @@ def process_video_concatenate(
                     f"[{current_a}][{next_a}]acrossfade=d={d_k}[{out_a}]"
                 )
 
+                # Update composed length: add lead-in and clip k, subtract overlap d_k
+                current_len = current_len + prepad_k + durations[k] - d_k
+
                 current_v, current_a = out_v, out_a
 
             filter_complex = "; ".join(filter_lines)
 
-            # Execute
+            # Execute via subprocess to map labeled pads safely, enable genpts for container safety
             cmd = ["ffmpeg", "-y"]
             for p in input_files:
                 cmd += ["-i", p]
@@ -212,7 +216,9 @@ def process_video_concatenate(
                 "-map", f"[{current_v}]",
                 "-map", f"[{current_a}]",
                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
-                "-c:a", "aac", "-movflags", "+faststart",
+                "-c:a", "aac",
+                "-movflags", "+faststart",
+                "-fflags", "+genpts",
                 output_path
             ]
             subprocess.run(cmd, check=True)
